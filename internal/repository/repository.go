@@ -9,28 +9,22 @@ import (
 )
 
 type Repository struct {
-	mu                sync.RWMutex
-	devices           map[string]domain.Device
-	cases             map[string]domain.VerificationCase
-	measurements      map[string][]domain.Measurement
-	seals             map[string]domain.EvidenceSeal
-	reviewCycles      map[string]int
-	cycleMeasurements map[string]map[int][]domain.Measurement
-	sealClaims        map[string]string
-	events            []domain.AuditEvent
-	counters          map[string]int
+	mu           sync.RWMutex
+	devices      map[string]domain.Device
+	cases        map[string]domain.VerificationCase
+	measurements map[string][]domain.Measurement
+	seals        map[string]domain.EvidenceSeal
+	events       []domain.AuditEvent
+	counters     map[string]int
 }
 
 func New() *Repository {
 	return &Repository{
-		devices:           make(map[string]domain.Device),
-		cases:             make(map[string]domain.VerificationCase),
-		measurements:      make(map[string][]domain.Measurement),
-		seals:             make(map[string]domain.EvidenceSeal),
-		reviewCycles:      make(map[string]int),
-		cycleMeasurements: make(map[string]map[int][]domain.Measurement),
-		sealClaims:        make(map[string]string),
-		counters:          make(map[string]int),
+		devices:      make(map[string]domain.Device),
+		cases:        make(map[string]domain.VerificationCase),
+		measurements: make(map[string][]domain.Measurement),
+		seals:        make(map[string]domain.EvidenceSeal),
+		counters:     make(map[string]int),
 	}
 }
 
@@ -97,15 +91,12 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 }
 
 type Mutation struct {
-	devices           map[string]domain.Device
-	cases             map[string]domain.VerificationCase
-	measurements      map[string][]domain.Measurement
-	seals             map[string]domain.EvidenceSeal
-	reviewCycles      map[string]int
-	cycleMeasurements map[string]map[int][]domain.Measurement
-	sealClaims        map[string]string
-	events            []domain.AuditEvent
-	counters          map[string]int
+	devices      map[string]domain.Device
+	cases        map[string]domain.VerificationCase
+	measurements map[string][]domain.Measurement
+	seals        map[string]domain.EvidenceSeal
+	events       []domain.AuditEvent
+	counters     map[string]int
 }
 
 func (m *Mutation) NextID(prefix string) string {
@@ -153,8 +144,6 @@ func (m *Mutation) PutCase(item domain.VerificationCase) error {
 		return fmt.Errorf("%w: case %s", domain.ErrStateConflict, item.ID)
 	}
 	m.cases[item.ID] = item
-	m.reviewCycles[item.ID] = 1
-	m.cycleMeasurements[item.ID] = make(map[int][]domain.Measurement)
 	return nil
 }
 
@@ -175,20 +164,21 @@ func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase
 	return domain.VerificationCase{}, false
 }
 
+// AppendMeasurement records an observed value. The measurement itself carries
+// the review cycle it belongs to, so each repair round keeps an independent,
+// traceable measurement context.
 func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
-	if _, exists := m.cases[item.CaseID]; !exists {
+	current, exists := m.cases[item.CaseID]
+	if !exists {
 		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
 	}
-	cycle := m.reviewCycles[item.CaseID]
-	if cycle < 1 {
-		cycle = 1
-		m.reviewCycles[item.CaseID] = cycle
+	if current.State == domain.CaseSealed {
+		return fmt.Errorf("%w: case %s is sealed", domain.ErrStateConflict, item.CaseID)
 	}
-	if m.cycleMeasurements[item.CaseID] == nil {
-		m.cycleMeasurements[item.CaseID] = make(map[int][]domain.Measurement)
+	if item.ReviewCycle != current.ReviewCycle {
+		return fmt.Errorf("%w: measurement review cycle %d does not match case review cycle %d", domain.ErrStateConflict, item.ReviewCycle, current.ReviewCycle)
 	}
 	m.measurements[item.CaseID] = append(m.measurements[item.CaseID], item)
-	m.cycleMeasurements[item.CaseID][cycle] = append(m.cycleMeasurements[item.CaseID][cycle], item)
 	return nil
 }
 
@@ -196,32 +186,16 @@ func (m *Mutation) Measurements(caseID string) []domain.Measurement {
 	return append([]domain.Measurement(nil), m.measurements[caseID]...)
 }
 
-func (m *Mutation) MeasurementForReview(caseID string, cycle int) (domain.Measurement, bool) {
-	items := m.cycleMeasurements[caseID][cycle]
-	if len(items) == 0 && cycle > 1 {
-		items = m.cycleMeasurements[caseID][cycle-1]
+// MeasurementsForCycle returns only the measurements recorded within one
+// review cycle. Earlier rounds are never mixed into the current review.
+func (m *Mutation) MeasurementsForCycle(caseID string, cycle int) []domain.Measurement {
+	var result []domain.Measurement
+	for _, item := range m.measurements[caseID] {
+		if item.ReviewCycle == cycle {
+			result = append(result, item)
+		}
 	}
-	if len(items) == 0 {
-		return domain.Measurement{}, false
-	}
-	return items[0], true
-}
-
-func (m *Mutation) PutSealClaim(caseID, measurementID string) error {
-	if _, exists := m.sealClaims[caseID]; exists {
-		return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, caseID)
-	}
-	m.sealClaims[caseID] = measurementID
-	return nil
-}
-
-func (m *Mutation) SealClaim(caseID string) (string, bool) {
-	measurementID, exists := m.sealClaims[caseID]
-	return measurementID, exists
-}
-
-func (m *Mutation) DeleteSealClaim(caseID string) {
-	delete(m.sealClaims, caseID)
+	return result
 }
 
 func (m *Mutation) Seal(caseID string) (domain.EvidenceSeal, bool) {
@@ -268,15 +242,12 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	defer r.mu.Unlock()
 
 	next := &Mutation{
-		devices:           cloneDevices(r.devices),
-		cases:             cloneCases(r.cases),
-		measurements:      cloneMeasurements(r.measurements),
-		seals:             cloneSeals(r.seals),
-		reviewCycles:      cloneReviewCycles(r.reviewCycles),
-		cycleMeasurements: cloneCycleMeasurements(r.cycleMeasurements),
-		sealClaims:        cloneSealClaims(r.sealClaims),
-		events:            append([]domain.AuditEvent(nil), r.events...),
-		counters:          cloneCounters(r.counters),
+		devices:      cloneDevices(r.devices),
+		cases:        cloneCases(r.cases),
+		measurements: cloneMeasurements(r.measurements),
+		seals:        cloneSeals(r.seals),
+		events:       append([]domain.AuditEvent(nil), r.events...),
+		counters:     cloneCounters(r.counters),
 	}
 	if err := fn(next); err != nil {
 		return err
@@ -285,9 +256,6 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
-	r.reviewCycles = next.reviewCycles
-	r.cycleMeasurements = next.cycleMeasurements
-	r.sealClaims = next.sealClaims
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -329,34 +297,6 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func cloneReviewCycles(values map[string]int) map[string]int {
-	result := make(map[string]int, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func cloneCycleMeasurements(values map[string]map[int][]domain.Measurement) map[string]map[int][]domain.Measurement {
-	result := make(map[string]map[int][]domain.Measurement, len(values))
-	for caseID, cycles := range values {
-		copied := make(map[int][]domain.Measurement, len(cycles))
-		for cycle, items := range cycles {
-			copied[cycle] = append([]domain.Measurement(nil), items...)
-		}
-		result[caseID] = copied
-	}
-	return result
-}
-
-func cloneSealClaims(values map[string]string) map[string]string {
-	result := make(map[string]string, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

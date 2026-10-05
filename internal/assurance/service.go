@@ -146,19 +146,21 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		at := s.now()
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
+			item.ReviewCycle,
 			input.Observed,
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		if err := item.RecordMeasurement(measurement.Accepted, at); err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -168,10 +170,10 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			return err
 		}
 		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
+		detail := fmt.Sprintf("measurement exceeded tolerance in review cycle %d and requires another measurement", measurement.ReviewCycle)
 		if measurement.Accepted {
 			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
+			detail = fmt.Sprintf("measurement %s accepted in review cycle %d and ready for review", measurement.ID, measurement.ReviewCycle)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -181,7 +183,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			kind,
 			measurement.Technician,
 			detail,
-			s.now(),
+			at,
 		)
 		if err != nil {
 			return err
@@ -201,16 +203,18 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if err := item.Reopen(s.now()); err != nil {
-			return err
-		}
-		if err := m.UpdateCase(item); err != nil {
-			return err
-		}
 		actor := strings.TrimSpace(input.Actor)
 		reason := strings.TrimSpace(input.Reason)
 		if actor == "" || reason == "" {
 			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
+		previousCycle := item.ReviewCycle
+		at := s.now()
+		if err := item.Reopen(at); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -219,8 +223,8 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 			item.ID,
 			"case_reopened",
 			actor,
-			reason,
-			s.now(),
+			fmt.Sprintf("review cycle %d closed as out of tolerance; review cycle %d opened: %s", previousCycle, item.ReviewCycle, reason),
+			at,
 		)
 		if err != nil {
 			return err
@@ -233,8 +237,17 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 }
 
 func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.SealCaseRequest) (contracts.CaseResponse, error) {
+	reviewer := strings.TrimSpace(input.Reviewer)
+	summary := strings.TrimSpace(input.Summary)
+	if reviewer == "" || summary == "" {
+		return contracts.CaseResponse{}, fmt.Errorf("%w: reviewer and summary are required", domain.ErrInvalidInput)
+	}
+
 	var result contracts.CaseResponse
-	var claimed domain.Measurement
+	// Seal in a single atomic commit. Re-checking state, seal uniqueness, and
+	// the current-cycle evidence basis under the repository lock means a
+	// rejected request leaves no claim or partial state behind, while a
+	// concurrent request simply observes the already-sealed case.
 	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
 		id := strings.TrimSpace(caseID)
 		item, exists := m.Case(id)
@@ -244,47 +257,23 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
-		if _, exists := m.SealClaim(item.ID); exists {
-			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
-		}
-		measurement, ok := m.MeasurementForReview(item.ID, item.ReviewCycle)
+		measurement, ok := bestAcceptedMeasurement(m.MeasurementsForCycle(item.ID, item.ReviewCycle))
 		if !ok {
-			return fmt.Errorf("%w: a measurement for review cycle %d is required before sealing", domain.ErrStateConflict, item.ReviewCycle)
+			return fmt.Errorf("%w: an accepted measurement for review cycle %d is required before sealing", domain.ErrStateConflict, item.ReviewCycle)
 		}
-		if err := m.PutSealClaim(item.ID, measurement.ID); err != nil {
-			return err
-		}
-		claimed = measurement
-		return nil
-	})
-	if err != nil {
-		return result, err
-	}
-
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
-		id := strings.TrimSpace(caseID)
-		item, exists := m.Case(id)
-		if !exists {
-			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
-		}
-		if _, exists := m.Seal(item.ID); exists {
-			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
-		}
-		measurementID, exists := m.SealClaim(item.ID)
-		if !exists || measurementID != claimed.ID {
-			return fmt.Errorf("%w: seal claim is not active for case %s", domain.ErrStateConflict, item.ID)
-		}
-		if err := item.Seal(s.now()); err != nil {
+		at := s.now()
+		if err := item.Seal(at); err != nil {
 			return err
 		}
 		seal, err := domain.NewEvidenceSeal(
 			m.NextID("seal"),
 			item.ID,
 			item.DeviceID,
-			claimed.ID,
-			input.Reviewer,
-			input.Summary,
-			s.now(),
+			measurement.ID,
+			measurement.ReviewCycle,
+			reviewer,
+			summary,
+			at,
 		)
 		if err != nil {
 			return err
@@ -302,14 +291,13 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			item.ID,
 			"case_sealed",
 			seal.Reviewer,
-			seal.Summary,
-			s.now(),
+			fmt.Sprintf("evidence sealed in review cycle %d on accepted measurement %s", seal.ReviewCycle, seal.MeasurementID),
+			at,
 		)
 		if err != nil {
 			return err
 		}
 		m.AppendEvent(event)
-		m.DeleteSealClaim(item.ID)
 		result = caseResponse(m, item)
 		return nil
 	})
