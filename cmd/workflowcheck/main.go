@@ -40,6 +40,7 @@ func main() {
 		"record-measurement":       checkRecordMeasurement,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
+		"seal-after-rework":        checkSealAfterRework,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,226 @@ func checkSealVerification() error {
 	return nil
 }
 
+// checkSealAfterRework verifies that evidence gathered after a rework is
+// scoped to the current review cycle, that incomplete seal submissions leave
+// the case untouched, and that concurrent seal attempts still produce exactly
+// one seal.
+func checkSealAfterRework() error {
+	h := newHarness()
+	defer h.close()
+
+	// Cycle 1: out-of-tolerance reading, reopen, cycle 2 accepted reading.
+	caseID, err := h.rejectedCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	reopened, err := h.request(http.MethodPost, "/cases/"+caseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "fixture replaced after out-of-tolerance reading",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	second, err := h.recordMeasurement(caseID, 25.1, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(second, http.StatusCreated); err != nil {
+		return err
+	}
+
+	// An incomplete seal submission must not change the case or block a later
+	// correct submission.
+	incomplete, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Mira",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(incomplete, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(incomplete, "invalid_input"); err != nil {
+		return err
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(read, http.StatusOK); err != nil {
+		return err
+	}
+	state, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("rejected seal attempt changed case state to %q", state)
+	}
+	if _, ok := read.Body["seal"]; ok {
+		return errors.New("rejected seal attempt left an evidence seal behind")
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Mira",
+		"summary":  "accepted rework measurement sealed",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+
+	sealCycle, err := nestedFloat(sealed.Body, "seal", "review_cycle")
+	if err != nil {
+		return err
+	}
+	if sealCycle != 2 {
+		return fmt.Errorf("seal review cycle = %v, expected 2", sealCycle)
+	}
+	sealMeasurementID, err := nestedString(sealed.Body, "seal", "measurement_id")
+	if err != nil {
+		return err
+	}
+	measurements, err := nestedSlice(sealed.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	var evidence map[string]any
+	for _, item := range measurements {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if entry["id"] == sealMeasurementID {
+			evidence = entry
+		}
+	}
+	if evidence == nil {
+		return fmt.Errorf("seal references unknown measurement %q", sealMeasurementID)
+	}
+	if cycle, _ := evidence["review_cycle"].(float64); cycle != 2 {
+		return fmt.Errorf("seal cites a cycle-%v reading, expected the cycle-2 reading", cycle)
+	}
+	if accepted, _ := evidence["accepted"].(bool); !accepted {
+		return errors.New("seal cites an out-of-tolerance reading from before the rework")
+	}
+
+	events, err := nestedSlice(sealed.Body, "events")
+	if err != nil {
+		return err
+	}
+	var sealedEvent map[string]any
+	for _, item := range events {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if entry["kind"] == "case_sealed" {
+			sealedEvent = entry
+		}
+	}
+	if sealedEvent == nil {
+		return errors.New("case_sealed audit event is missing")
+	}
+	detail, _ := sealedEvent["detail"].(string)
+	if !strings.Contains(detail, "review cycle 2") || !strings.Contains(detail, sealMeasurementID) {
+		return fmt.Errorf("seal event detail does not trace its cycle and evidence: %q", detail)
+	}
+
+	// Two full rework rounds: the final seal must cite the cycle-3 reading and
+	// never fall back to an earlier rejected cycle.
+	twiceCaseID, err := h.rejectedCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	reworkReadings := []float64{26.4, 25.1}
+	for _, observed := range reworkReadings {
+		reopened, err := h.request(http.MethodPost, "/cases/"+twiceCaseID+"/reopen", map[string]any{
+			"actor":  "Lin",
+			"reason": "another repair pass",
+		})
+		if err != nil {
+			return err
+		}
+		if err := expectStatus(reopened, http.StatusOK); err != nil {
+			return err
+		}
+		response, err := h.recordMeasurement(twiceCaseID, observed, "Rui")
+		if err != nil {
+			return err
+		}
+		if err := expectStatus(response, http.StatusCreated); err != nil {
+			return err
+		}
+	}
+	final, err := h.request(http.MethodPost, "/cases/"+twiceCaseID+"/seal", map[string]any{
+		"reviewer": "Mira",
+		"summary":  "accepted after two repair rounds",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(final, http.StatusCreated); err != nil {
+		return err
+	}
+	cycle, err := nestedFloat(final.Body, "seal", "review_cycle")
+	if err != nil {
+		return err
+	}
+	if cycle != 3 {
+		return fmt.Errorf("seal review cycle after two reworks = %v, expected 3", cycle)
+	}
+
+	// Near-simultaneous seal attempts against one review-ready case still
+	// resolve to exactly one seal and one conflict, with no stuck claim.
+	raceCaseID, err := h.readyCase("MET-1503")
+	if err != nil {
+		return err
+	}
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/seal", map[string]any{
+				"reviewer": fmt.Sprintf("Reviewer-%d", index+1),
+				"summary":  "concurrent seal attempt",
+			})
+			results <- outcome{response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+	successes, conflicts := 0, 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent seal status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("concurrent seal outcomes: %d success, %d conflict", successes, conflicts)
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -549,6 +770,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedFloat(root map[string]any, path ...string) (float64, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a number", strings.Join(path, "."))
+	}
+	return number, nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {
